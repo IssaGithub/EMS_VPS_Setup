@@ -1,0 +1,219 @@
+name: Deploy Website with NGINX and SSL
+
+on:
+  workflow_dispatch:
+    inputs:
+      website_folder:
+        description: 'Website folder name'
+        required: true
+        type: string
+      domain_name:
+        description: 'Domain name (e.g., example.com)'
+        required: true
+        type: string
+      email:
+        description: 'Email for Lets Encrypt'
+        required: true
+        type: string
+      server_host:
+        description: 'Server IP address'
+        required: true
+        type: string
+      server_user:
+        description: 'SSH username'
+        required: true
+        type: string
+        default: 'root'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      
+    - name: Setup SSH
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H ${{ inputs.server_host }} >> ~/.ssh/known_hosts
+        
+        # Generate public key from private key
+        ssh-keygen -y -f ~/.ssh/id_rsa > ~/.ssh/id_rsa.pub
+    
+    - name: Configure SSH Key Authentication
+      run: |
+        ssh ${{ inputs.server_user }}@${{ inputs.server_host }} << 'SSH_CONFIG_EOF'
+        # Create .ssh directory and set permissions
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+        
+        # Backup existing authorized_keys if it exists
+        if [ -f ~/.ssh/authorized_keys ]; then
+          cp ~/.ssh/authorized_keys ~/.ssh/authorized_keys.backup.$(date +%Y%m%d_%H%M%S)
+        fi
+        
+        # Configure SSH daemon for key authentication
+        cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)
+        
+        # Enable key authentication and improve security
+        sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+        sed -i 's/#AuthorizedKeysFile/AuthorizedKeysFile/' /etc/ssh/sshd_config
+        
+        # Optional: Disable password authentication (uncomment next line for better security)
+        # sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+        
+        # Restart SSH service to apply changes
+        systemctl restart sshd
+        
+        echo "SSH key authentication configured successfully"
+        SSH_CONFIG_EOF
+        
+        # Copy public key to server
+        cat ~/.ssh/id_rsa.pub | ssh ${{ inputs.server_user }}@${{ inputs.server_host }} "cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+      
+    - name: Install NGINX
+      run: |
+        ssh ${{ inputs.server_user }}@${{ inputs.server_host }} << 'NGINX_EOF'
+        if ! command -v nginx >/dev/null 2>&1; then
+          apt update && apt install -y nginx
+          systemctl enable nginx && systemctl start nginx
+        fi
+        systemctl status nginx --no-pager
+        NGINX_EOF
+    
+    - name: Create Website Directory
+      run: |
+        ssh ${{ inputs.server_user }}@${{ inputs.server_host }} << 'WEBDIR_EOF'
+        FOLDER="${{ inputs.website_folder }}"
+        mkdir -p "/var/www/$FOLDER"
+        chown -R www-data:www-data "/var/www/$FOLDER"
+        chmod -R 755 "/var/www/$FOLDER"
+        
+        if [ ! -f "/var/www/$FOLDER/index.html" ]; then
+          echo "<!DOCTYPE html><html><head><title>Welcome</title><style>body{font-family:Arial;text-align:center;margin-top:50px}.success{color:#28a745}</style></head><body><h1 class=\"success\">🎉 Website Successfully Deployed!</h1><p>Your website is now live with NGINX!</p><p>You can now upload your website files to this directory.</p></body></html>" > "/var/www/$FOLDER/index.html"
+          chown www-data:www-data "/var/www/$FOLDER/index.html"
+        fi
+        WEBDIR_EOF
+    
+    - name: Install Certbot
+      run: |
+        ssh ${{ inputs.server_user }}@${{ inputs.server_host }} << 'CERTBOT_EOF'
+        if ! command -v certbot >/dev/null 2>&1; then
+          apt update && apt install -y snapd
+          systemctl enable snapd && systemctl start snapd
+          sleep 10
+          snap install core && snap refresh core
+          snap install --classic certbot
+          ln -sf /snap/bin/certbot /usr/bin/certbot
+        fi
+        CERTBOT_EOF
+    
+    - name: Configure NGINX
+      run: |
+        ssh ${{ inputs.server_user }}@${{ inputs.server_host }} << 'CONFIG_EOF'
+        DOMAIN="${{ inputs.domain_name }}"
+        FOLDER="${{ inputs.website_folder }}"
+        
+        # Create NGINX config file
+        echo "server {
+            listen 80;
+            server_name $DOMAIN www.$DOMAIN;
+            root /var/www/$FOLDER;
+            index index.html;
+            
+            location / {
+                try_files \$uri \$uri/ =404;
+            }
+        }" > "/etc/nginx/sites-available/$DOMAIN"
+        
+        ln -sf "/etc/nginx/sites-available/$DOMAIN" "/etc/nginx/sites-enabled/"
+        nginx -t && systemctl reload nginx
+        CONFIG_EOF
+    
+    - name: Setup SSL Certificate
+      run: |
+        ssh ${{ inputs.server_user }}@${{ inputs.server_host }} << 'SSL_EOF'
+        DOMAIN="${{ inputs.domain_name }}"
+        EMAIL="${{ inputs.email }}"
+        
+        # Check if domain is an IP address
+        if [[ $DOMAIN =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "⚠️  Skipping SSL certificate setup - Let's Encrypt doesn't support IP addresses"
+          echo "   To enable HTTPS, you need to:"
+          echo "   1. Get a domain name (e.g., from Namecheap, GoDaddy, etc.)"
+          echo "   2. Point the domain to your server IP: $DOMAIN"
+          echo "   3. Re-run this workflow with your domain name instead of IP"
+        else
+          echo "Setting up SSL certificate for domain: $DOMAIN"
+          
+          if [ ! -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+            echo "Obtaining SSL certificate..."
+            certbot --nginx -d "$DOMAIN" -d "www.$DOMAIN" \
+              --non-interactive --agree-tos --email "$EMAIL" --redirect
+            
+            if [ $? -eq 0 ]; then
+              echo "✅ SSL certificate obtained successfully"
+            else
+              echo "❌ Failed to obtain SSL certificate"
+              echo "   Make sure:"
+              echo "   1. Domain $DOMAIN points to this server"
+              echo "   2. Ports 80 and 443 are open"
+              echo "   3. Domain is accessible from the internet"
+            fi
+          else
+            echo "✅ SSL certificate already exists for $DOMAIN"
+          fi
+        fi
+        
+        # Setup auto-renewal cron job regardless of SSL status
+        if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
+          (crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet") | crontab -
+          echo "✅ SSL certificate auto-renewal scheduled"
+        fi
+        SSL_EOF
+    
+    - name: Verify Deployment
+      run: |
+        ssh ${{ inputs.server_user }}@${{ inputs.server_host }} '
+        echo "=== Deployment Verification ==="
+        
+        # Check SSH Key Authentication
+        [ -f ~/.ssh/authorized_keys ] && echo "✅ SSH Keys Configured" || echo "❌ SSH Keys Missing"
+        grep -q "PubkeyAuthentication yes" /etc/ssh/sshd_config && echo "✅ SSH Key Auth Enabled" || echo "❌ SSH Key Auth Disabled"
+        
+        # Check NGINX
+        systemctl is-active nginx && echo "✅ NGINX Running" || echo "❌ NGINX Failed"
+        
+        # Check Website Directory
+        [ -d "/var/www/${{ inputs.website_folder }}" ] && echo "✅ Directory Created" || echo "❌ Directory Missing"
+        
+        # Check NGINX Configuration
+        nginx -t && echo "✅ Config Valid" || echo "❌ Config Invalid"
+        
+        # Check SSL Certificate (only if domain is not an IP address)
+        DOMAIN="${{ inputs.domain_name }}"
+        if [[ $DOMAIN =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "⚠️  SSL Certificate: Skipped (IP address - use a domain name for SSL)"
+        else
+          [ -f "/etc/letsencrypt/live/$DOMAIN/cert.pem" ] && echo "✅ SSL Certificate" || echo "❌ SSL Missing"
+        fi
+        
+        # Check Certbot Auto-renewal
+        crontab -l | grep -q "certbot renew" && echo "✅ Auto-renewal Configured" || echo "❌ Auto-renewal Missing"
+        
+        echo ""
+        echo "🚀 Deployment completed successfully!"
+        echo "Your website is accessible at:"
+        if [[ $DOMAIN =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "   HTTP:  http://$DOMAIN"
+          echo "   Note: HTTPS not available with IP address. Use a domain name for SSL."
+        else
+          echo "   HTTP:  http://$DOMAIN"
+          echo "   HTTPS: https://$DOMAIN"
+        fi
+        echo ""
+        echo "🔐 SSH Key Authentication is now enabled!"
+        echo "You can now connect securely using: ssh ${{ inputs.server_user }}@${{ inputs.server_host }}"
+        ' 
