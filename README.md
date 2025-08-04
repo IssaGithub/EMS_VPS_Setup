@@ -8,7 +8,7 @@ This repository contains a GitHub Actions workflow that automatically:
 
 ## Prerequisites
 
-### 1. VPS Server Requirements
+### 1. VPS Server Requirements s
 - Ubuntu/Debian-based Linux server
 - Root or sudo access
 - Domain name pointing to your server's IP address
