@@ -216,4 +216,4 @@ jobs:
         echo ""
         echo "🔐 SSH Key Authentication is now enabled!"
         echo "You can now connect securely using: ssh ${{ inputs.server_user }}@${{ inputs.server_host }}"
-        ' 
+        '
